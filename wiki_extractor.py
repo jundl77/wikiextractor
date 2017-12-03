@@ -57,12 +57,10 @@ collecting template definitions.
 from __future__ import unicode_literals, division
 
 import sys
-import argparse
 import bz2
 import codecs
 import cgi
 import fileinput
-import logging
 import os.path
 import re  # TODO use regex when it will be standard
 import time
@@ -71,6 +69,10 @@ from io import StringIO
 from multiprocessing import Queue, Process, Value, cpu_count
 from timeit import default_timer
 
+from word2doc.util import constants
+from word2doc.util import logger
+
+logging = logger.get_logger()
 
 PY2 = sys.version_info[0] == 2
 # Python 2.7 compatibiity
@@ -522,7 +524,7 @@ class Extractor(object):
     """
     An extraction task on a article.
     """
-    def __init__(self, id, revid, title, lines):
+    def __init__(self, id, revid, title, lines, extract_references):
         """
         :param id: id of page.
         :param title: tutle of page.
@@ -532,6 +534,7 @@ class Extractor(object):
         self.revid = revid
         self.title = title
         self.text = ''.join(lines)
+        self.references = extract_references
         self.magicWords = MagicWords()
         self.frame = Frame()
         self.recursion_exceeded_1_errs = 0  # template recursion within expand()
@@ -546,12 +549,24 @@ class Extractor(object):
         """
         url = get_url(self.id)
         if options.write_json:
-            json_data = {
-                'id': self.id,
-                'url': url,
-                'title': self.title,
-                'text': "\n".join(text)
-            }
+
+            json_data = {}
+            if self.references:
+                json_data = {
+                    'id': self.id,
+                    'url': url,
+                    'title': self.title,
+                    'references': self.references,
+                    'text': "\n".join(text)
+                }
+            else:
+                json_data = {
+                    'id': self.id,
+                    'url': url,
+                    'title': self.title,
+                    'text': "\n".join(text)
+                }
+
             if options.print_revision:
                 json_data['revid'] = self.revid
             # We don't use json.dump(data, out) because we want to be
@@ -582,6 +597,10 @@ class Extractor(object):
         :param out: a memory file.
         """
         logging.info('%s\t%s', self.id, self.title)
+
+        # Extract references to main articles
+        if self.references:
+            self.__extract_references(self.text)
         
         # Separate header from text with a newline.
         if options.toHTML:
@@ -644,6 +663,20 @@ class Extractor(object):
             logging.warn("Template errors in article '%s' (%s): title(%d) recursion(%d, %d, %d)",
                          self.title, self.id, *errs)
 
+    def __extract_references(self, text):
+        """Find out what references are in the document with the title 'title'"""
+
+        doc_regex = r'(?i)({{Main( article)?(\|[\w ]+)+}})'
+        ref_regex = r'(\|([\w ]+))'
+        matches = re.findall(doc_regex, text)
+        doc_matches = list(map(lambda m: m[0], matches))
+
+        matches = []
+        for match in doc_matches:
+            ref_matches = re.findall(ref_regex, match)
+            matches += list(map(lambda m: m[1], ref_matches))
+
+        self.references = list(map(lambda m: m.strip(), matches))
 
     def transform(self, wikitext):
         """
@@ -2827,8 +2860,7 @@ def pages_from(input):
             page = []
 
 
-def process_dump(input_file, template_file, out_file, file_size, file_compress,
-                 process_count):
+def process_dump(input_file, template_file, out_file, file_size, extract_references, file_compress, process_count):
     """
     :param input_file: name of the wikipedia dump file; '-' to read from stdin
     :param template_file: optional file with template definitions.
@@ -2930,7 +2962,7 @@ def process_dump(input_file, template_file, out_file, file_size, file_compress,
     workers = []
     for i in range(worker_count):
         extractor = Process(target=extract_process,
-                            args=(options, i, jobs_queue, output_queue))
+                            args=(options, i, jobs_queue, output_queue, extract_references))
         extractor.daemon = True  # only live while parent process lives
         extractor.start()
         workers.append(extractor)
@@ -2978,7 +3010,7 @@ def process_dump(input_file, template_file, out_file, file_size, file_compress,
 # Multiprocess support
 
 
-def extract_process(opts, i, jobs_queue, output_queue):
+def extract_process(opts, i, jobs_queue, output_queue, extract_references):
     """Pull tuples of raw page content, do CPU/regex-heavy fixup, push finished text
     :param i: process id.
     :param jobs_queue: where to get jobs.
@@ -2988,17 +3020,14 @@ def extract_process(opts, i, jobs_queue, output_queue):
     global options
     options = opts
 
-    createLogger(options.quiet, options.debug)
-
     out = StringIO()                 # memory buffer
-    
-    
+
     while True:
         job = jobs_queue.get()  # job is (id, title, page, page_num)
         if job:
             id, revid, title, page, page_num = job
             try:
-                e = Extractor(*job[:4]) # (id, revid, title, page)
+                e = Extractor(id, revid, title, page, extract_references) # (id, revid, title, page)
                 page = None              # free memory
                 e.extract(out)
                 text = out.getvalue()
@@ -3029,9 +3058,7 @@ def reduce_process(opts, output_queue, spool_length,
 
     global options
     options = opts
-    
-    createLogger(options.quiet, options.debug)
-    
+
     if out_file:
         nextFile = NextFile(out_file)
         output = OutputSplitter(nextFile, file_size, file_compress)
@@ -3079,98 +3106,90 @@ def reduce_process(opts, output_queue, spool_length,
 # Minimum size of output files
 minFileSize = 200 * 1024
 
-def main():
 
-    parser = argparse.ArgumentParser(prog=os.path.basename(sys.argv[0]),
-                                     formatter_class=argparse.RawDescriptionHelpFormatter,
-                                     description=__doc__)
-    parser.add_argument("input",
-                        help="XML wiki dump file")
-    groupO = parser.add_argument_group('Output')
-    groupO.add_argument("-o", "--output", default="text",
-                        help="directory for extracted files (or '-' for dumping to stdout)")
-    groupO.add_argument("-b", "--bytes", default="1M",
-                        help="maximum bytes per output file (default %(default)s)",
-                        metavar="n[KMG]")
-    groupO.add_argument("-c", "--compress", action="store_true",
-                        help="compress output files using bzip")
-    groupO.add_argument("--json", action="store_true",
-                        help="write output in json format instead of the default one")
+def extract_wiki(input,
+                 output='text',
+                 bytes='1M',
+                 compress=False,
+                 json=False,
+                 html=False,
+                 links=False,
+                 references=False,
+                 sections=False,
+                 lists=False,
+                 namespaces='',
+                 templates=False,
+                 no_templates=True,
+                 revision=False,
+                 min_text_length=None,
+                 filter_disambig_pages=False,
+                 ignored_tags='',
+                 discard_elements='',
+                 keep_tables=False,
+                 quiet=False,
+                 debug=False,
+                 article=False):
+    """
 
+    :param input: XML wiki dump file
+    :param output: directory for extracted files (or '-' for dumping to stdout)
+    :param bytes: maximum bytes per output file (default %(default)s)
+    :param compress: compress output files using bzip
+    :param json: write output in json format instead of the default one
+    :param html: produce HTML output, subsumes --links
+    :param links: preserve links
+    :param references: extract main article references
+    :param sections: preserve sections
+    :param lists: preserve lists
+    :param namespaces: accepted namespaces in links
+    :param templates: use or create file containing templates
+    :param no_templates: Do not expand templates
+    :param revision: Include the document revision id (default=%(default)s)
+    :param min_text_length: Minimum expanded text length required to write document (default=%(default)s)
+    :param filter_disambig_pages: Remove pages from output that contain disabmiguation markup (default=%(default)s)
+    :param ignored_tags: comma separated list of tags that will be dropped, keeping their content
+    :param discard_elements: comma separated list of elements that will be removed from the article text
+    :param keep_tables: Preserve tables in the output article text (default=%(default)s)
+    :param quiet: suppress reporting progress info
+    :param debug: print debug info
+    :param article: analyze a file containing a single article (debug option)
+    :return:
+    """
 
-    groupP = parser.add_argument_group('Processing')
-    groupP.add_argument("--html", action="store_true",
-                        help="produce HTML output, subsumes --links")
-    groupP.add_argument("-l", "--links", action="store_true",
-                        help="preserve links")
-    groupP.add_argument("-s", "--sections", action="store_true",
-                        help="preserve sections")
-    groupP.add_argument("--lists", action="store_true",
-                        help="preserve lists")
-    groupP.add_argument("-ns", "--namespaces", default="", metavar="ns1,ns2",
-                        help="accepted namespaces in links")
-    groupP.add_argument("--templates",
-                        help="use or create file containing templates")
-    groupP.add_argument("--no-templates", action="store_false",
-                        help="Do not expand templates")
-    groupP.add_argument("-r", "--revision", action="store_true", default=options.print_revision,
-                        help="Include the document revision id (default=%(default)s)")
-    groupP.add_argument("--min_text_length", type=int, default=options.min_text_length,
-                        help="Minimum expanded text length required to write document (default=%(default)s)")
-    groupP.add_argument("--filter_disambig_pages", action="store_true", default=options.filter_disambig_pages,
-                        help="Remove pages from output that contain disabmiguation markup (default=%(default)s)")
-    groupP.add_argument("-it", "--ignored_tags", default="", metavar="abbr,b,big",
-                        help="comma separated list of tags that will be dropped, keeping their content")
-    groupP.add_argument("-de", "--discard_elements", default="", metavar="gallery,timeline,noinclude",
-                        help="comma separated list of elements that will be removed from the article text")
-    groupP.add_argument("--keep_tables", action="store_true", default=options.keep_tables,
-                        help="Preserve tables in the output article text (default=%(default)s)")
-    default_process_count = max(1, cpu_count() - 1)
-    parser.add_argument("--processes", type=int, default=default_process_count,
-                        help="Number of processes to use (default %(default)s)")
+    revision = options.min_text_length
+    min_text_length = options.min_text_length
+    filter_disambig_pages = options.filter_disambig_pages
+    processes = constants.get_number_workers()
 
-    groupS = parser.add_argument_group('Special')
-    groupS.add_argument("-q", "--quiet", action="store_true",
-                        help="suppress reporting progress info")
-    groupS.add_argument("--debug", action="store_true",
-                        help="print debug info")
-    groupS.add_argument("-a", "--article", action="store_true",
-                        help="analyze a file containing a single article (debug option)")
-    groupS.add_argument("-v", "--version", action="version",
-                        version='%(prog)s ' + version,
-                        help="print program version")
-
-    args = parser.parse_args()
-
-    options.keepLinks = args.links
-    options.keepSections = args.sections
-    options.keepLists = args.lists
-    options.toHTML = args.html
-    options.write_json = args.json
-    options.print_revision = args.revision
-    options.min_text_length = args.min_text_length
-    if args.html:
+    options.keepLinks = links
+    options.keepSections = sections
+    options.keepLists = lists
+    options.toHTML = html
+    options.write_json = json
+    options.print_revision = revision
+    options.min_text_length = min_text_length
+    if html:
         options.keepLinks = True
 
-    options.expand_templates = args.no_templates
-    options.filter_disambig_pages = args.filter_disambig_pages
-    options.keep_tables = args.keep_tables
+    options.expand_templates = no_templates
+    options.filter_disambig_pages = filter_disambig_pages
+    options.keep_tables = keep_tables
 
     try:
-        power = 'kmg'.find(args.bytes[-1].lower()) + 1
-        file_size = int(args.bytes[:-1]) * 1024 ** power
+        power = 'kmg'.find(bytes[-1].lower()) + 1
+        file_size = int(bytes[:-1]) * 1024 ** power
         if file_size < minFileSize:
             raise ValueError()
     except ValueError:
-        logging.error('Insufficient or invalid size: %s', args.bytes)
+        logging.error('Insufficient or invalid size: %s', bytes)
         return
 
-    if args.namespaces:
-        options.acceptedNamespaces = set(args.namespaces.split(','))
+    if namespaces:
+        options.acceptedNamespaces = set(namespaces.split(','))
 
     # ignoredTags and discardElemets have default values already supplied, if passed in the defaults are overwritten
-    if args.ignored_tags:
-        ignoredTags = set(args.ignored_tags.split(','))
+    if ignored_tags:
+        ignoredTags = set(ignored_tags.split(','))
     else:
         ignoredTags = [
             'abbr', 'b', 'big', 'blockquote', 'center', 'cite', 'em',
@@ -3183,18 +3202,13 @@ def main():
     for tag in ignoredTags:
         ignoreTag(tag)
 
-    if args.discard_elements:
-        options.discardElements = set(args.discard_elements.split(','))
+    if discard_elements:
+        options.discardElements = set(discard_elements.split(','))
 
-    FORMAT = '%(levelname)s: %(message)s'
-    logging.basicConfig(format=FORMAT)
+    options.quiet = quiet
+    options.debug = debug
 
-    options.quiet = args.quiet
-    options.debug = args.debug
-    
-    createLogger(options.quiet, options.debug)
-
-    input_file = args.input
+    input_file = input
 
     if not options.keepLinks:
         ignoreTag('a')
@@ -3203,20 +3217,20 @@ def main():
     # manager = Manager()
     # templateCache = manager.dict()
 
-    if args.article:
-        if args.templates:
-            if os.path.exists(args.templates):
-                with open(args.templates) as file:
+    if article:
+        if templates:
+            if os.path.exists(templates):
+                with open(templates) as file:
                     load_templates(file)
 
         file = fileinput.FileInput(input_file, openhook=fileinput.hook_compressed)
         for page_data in pages_from(file):
             id, revid, title, ns, page = page_data
-            Extractor(id, revid, title, page).extract(sys.stdout)
+            Extractor(id, revid, title, page, references).extract(sys.stdout)
         file.close()
         return
 
-    output_path = args.output
+    output_path = output
     if output_path != '-' and not os.path.isdir(output_path):
         try:
             os.makedirs(output_path)
@@ -3224,15 +3238,5 @@ def main():
             logging.error('Could not create: %s', output_path)
             return
 
-    process_dump(input_file, args.templates, output_path, file_size,
-                 args.compress, args.processes)
+    process_dump(input_file, templates, output_path, file_size, references, compress, processes)
 
-def createLogger(quiet, debug):
-    logger = logging.getLogger()
-    if not quiet:
-        logger.setLevel(logging.INFO)
-    if debug:
-        logger.setLevel(logging.DEBUG)
-
-if __name__ == '__main__':
-    main()
